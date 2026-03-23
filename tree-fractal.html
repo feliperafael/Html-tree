@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Fractal Tree</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; overflow: hidden; }
+    canvas { display: block; }
+
+    #hud {
+      position: fixed;
+      bottom: 18px;
+      width: 100%;
+      text-align: center;
+      color: rgba(255,255,255,0.28);
+      font: 12px/1 'Courier New', monospace;
+      letter-spacing: 0.12em;
+      pointer-events: none;
+      user-select: none;
+    }
+
+    #phase-label {
+      position: fixed;
+      top: 18px;
+      right: 22px;
+      color: rgba(255,255,255,0.22);
+      font: 11px/1 'Courier New', monospace;
+      letter-spacing: 0.1em;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="hud">recursive binary tree fractal &nbsp;·&nbsp; depth 12</div>
+<div id="phase-label" id="phase-label">GROWING</div>
+
+<script>
+'use strict';
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Canvas setup
+// ─────────────────────────────────────────────────────────────────────────────
+const canvas = document.getElementById('canvas');
+const ctx    = canvas.getContext('2d');
+const label  = document.getElementById('phase-label');
+
+let W, H, bgGrad, moonGlow;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Configuration
+// ─────────────────────────────────────────────────────────────────────────────
+const CFG = {
+  maxDepth    : 12,        // recursion depth
+  ratio       : 0.685,     // child-branch length / parent-branch length
+  spread      : Math.PI / 5.8,   // half-angle between left & right branches
+  angleJitter : 0.28,      // max random angle variation per branch (radians)
+  growSpeed   : 2.0,       // depth-levels per second while growing
+  windScale   : 0.20,      // peak wind bend at tips (radians)
+  windFreqs   : [0.29, 0.53, 0.97, 1.73],  // superimposed frequencies (Hz)
+  windAmps    : [1.00, 0.50, 0.22, 0.09],  // relative amplitudes
+  trunkFrac   : 0.195,     // trunk length as fraction of canvas height
+  groundY     : 0.875,     // ground line as fraction of canvas height
+  starCount   : 240,
+  leafFadeSpd : 0.35,      // leaf opacity increase per second after full growth
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  State
+// ─────────────────────────────────────────────────────────────────────────────
+let growProgress = 0;   // 0 .. CFG.maxDepth
+let phase        = 'growing'; // 'growing' | 'swaying'
+let leafOpacity  = 0;
+let time         = 0;
+let prevTS       = null;
+
+// Per-frame drawing params (set before the recursive draw call)
+let _maxVis, _partial, _wind;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Deterministic per-branch pseudo-random (no re-seeding each frame)
+// ─────────────────────────────────────────────────────────────────────────────
+function stableRand(a, b) {
+  const x = Math.sin(a * 127.1 + b * 311.7 + 19.31) * 43758.5453123;
+  return x - Math.floor(x);
+}
+
+function angleJitter(depth, index) {
+  return (stableRand(depth, index) - 0.5) * CFG.angleJitter;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Wind
+// ─────────────────────────────────────────────────────────────────────────────
+const _windNorm = CFG.windAmps.reduce((a, b) => a + b, 0);
+
+function windValue(t) {
+  let w = 0;
+  for (let i = 0; i < CFG.windFreqs.length; i++) {
+    w += Math.sin(t * CFG.windFreqs[i] * 2 * Math.PI + i * 2.4) * CFG.windAmps[i];
+  }
+  return w / _windNorm; // normalised to ≈ [-1, 1]
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Branch colour & width
+//  depth 0 (trunk) → warm brown   depth maxDepth (tip) → yellow-green
+// ─────────────────────────────────────────────────────────────────────────────
+function branchColor(d) {
+  const t = d / CFG.maxDepth;
+  const r = Math.round(115 - t * 78);
+  const g = Math.round(62  + t * 115);
+  const b = Math.round(22  + t * 18);
+  return `rgb(${r},${g},${b})`;
+}
+
+function branchWidth(d) {
+  // Thicker at trunk (d=0), thin at tips
+  const raw = (CFG.maxDepth - d + 0.6) * 1.15;
+  return Math.max(0.45, raw);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Stars
+// ─────────────────────────────────────────────────────────────────────────────
+const STARS = Array.from({ length: CFG.starCount }, (_, i) => ({
+  x     : stableRand(i, 10),
+  y     : stableRand(i, 11) * 0.78,
+  r     : stableRand(i, 12) * 1.5 + 0.25,
+  phase : stableRand(i, 13) * Math.PI * 2,
+  speed : stableRand(i, 14) * 1.8 + 0.4,
+  color : stableRand(i, 15) > 0.85 ? 'warm' : 'white',
+}));
+
+function drawStars(t) {
+  for (const s of STARS) {
+    const bright = 0.25 + 0.75 * Math.pow(0.5 + 0.5 * Math.sin(t * s.speed + s.phase), 2);
+    ctx.beginPath();
+    ctx.arc(s.x * W, s.y * H, s.r, 0, Math.PI * 2);
+    if (s.color === 'warm') {
+      ctx.fillStyle = `rgba(255,230,180,${bright.toFixed(2)})`;
+    } else {
+      ctx.fillStyle = `rgba(210,220,255,${bright.toFixed(2)})`;
+    }
+    ctx.fill();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Moon
+// ─────────────────────────────────────────────────────────────────────────────
+function drawMoon() {
+  const mx = W * 0.78;
+  const my = H * 0.14;
+  const mr = Math.min(W, H) * 0.042;
+
+  // Outer glow
+  const glow = ctx.createRadialGradient(mx, my, mr * 0.6, mx, my, mr * 3.5);
+  glow.addColorStop(0,   'rgba(220, 210, 170, 0.18)');
+  glow.addColorStop(0.5, 'rgba(180, 175, 140, 0.07)');
+  glow.addColorStop(1,   'rgba(0,0,0,0)');
+  ctx.beginPath();
+  ctx.arc(mx, my, mr * 3.5, 0, Math.PI * 2);
+  ctx.fillStyle = glow;
+  ctx.fill();
+
+  // Moon disc
+  const disc = ctx.createRadialGradient(mx - mr * 0.2, my - mr * 0.2, mr * 0.05, mx, my, mr);
+  disc.addColorStop(0,   'rgba(255, 252, 230, 1)');
+  disc.addColorStop(0.7, 'rgba(230, 222, 190, 1)');
+  disc.addColorStop(1,   'rgba(200, 192, 155, 1)');
+  ctx.beginPath();
+  ctx.arc(mx, my, mr, 0, Math.PI * 2);
+  ctx.fillStyle = disc;
+  ctx.fill();
+
+  // Craters (subtle)
+  const craters = [
+    { dx: 0.3, dy: -0.1, r: 0.18 },
+    { dx: -0.25, dy: 0.3, r: 0.12 },
+    { dx: 0.1,  dy: 0.35, r: 0.09 },
+  ];
+  for (const c of craters) {
+    ctx.beginPath();
+    ctx.arc(mx + c.dx * mr, my + c.dy * mr, c.r * mr, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(150, 142, 110, 0.30)';
+    ctx.fill();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Background & Ground
+// ─────────────────────────────────────────────────────────────────────────────
+function buildBgGrad() {
+  bgGrad = ctx.createLinearGradient(0, 0, 0, H);
+  bgGrad.addColorStop(0.00, '#04080f');
+  bgGrad.addColorStop(0.50, '#0b1830');
+  bgGrad.addColorStop(0.80, '#112218');
+  bgGrad.addColorStop(1.00, '#090e0a');
+}
+
+function drawBackground() {
+  ctx.fillStyle = bgGrad;
+  ctx.fillRect(0, 0, W, H);
+}
+
+function drawGround() {
+  const gy = H * CFG.groundY;
+
+  // Moonlight reflection on ground
+  const mGlow = ctx.createRadialGradient(W * 0.5, gy, 0, W * 0.5, gy, W * 0.55);
+  mGlow.addColorStop(0,   'rgba(160,170,130,0.06)');
+  mGlow.addColorStop(0.6, 'rgba(80,100,60,0.03)');
+  mGlow.addColorStop(1,   'rgba(0,0,0,0)');
+  ctx.fillStyle = mGlow;
+  ctx.fillRect(0, gy, W, H - gy);
+
+  // Ground fill
+  const grd = ctx.createLinearGradient(0, gy, 0, H);
+  grd.addColorStop(0,   '#1c3520');
+  grd.addColorStop(0.4, '#142814');
+  grd.addColorStop(1,   '#080d08');
+  ctx.fillStyle = grd;
+  ctx.fillRect(0, gy, W, H - gy);
+
+  // Grass blades suggestion (thin horizontal shimmer at seam)
+  const shimmer = ctx.createLinearGradient(0, gy - 2, 0, gy + 6);
+  shimmer.addColorStop(0,   'rgba(60,110,50,0)');
+  shimmer.addColorStop(0.4, 'rgba(60,110,50,0.35)');
+  shimmer.addColorStop(1,   'rgba(60,110,50,0)');
+  ctx.fillStyle = shimmer;
+  ctx.fillRect(0, gy - 2, W, 8);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Leaf cluster at branch tip
+// ─────────────────────────────────────────────────────────────────────────────
+function drawLeaf(x, y, depth, idx) {
+  const base  = 3.2 + stableRand(depth, idx + 200) * 3.5;
+  const hue   = 88 + stableRand(depth + 1, idx) * 38;   // 88–126 (green to lime)
+  const light = 28 + stableRand(depth, idx + 50) * 14;
+  const alpha = (leafOpacity * 0.80).toFixed(2);
+  ctx.beginPath();
+  ctx.arc(x, y, base, 0, Math.PI * 2);
+  ctx.fillStyle = `hsla(${hue|0},58%,${light|0}%,${alpha})`;
+  ctx.fill();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Recursive branch drawing
+//
+//  depth      : current recursion depth (0 = trunk base)
+//  x, y       : start point of this segment
+//  baseAngle  : structural angle (no wind) inherited from parent split
+//  length     : this segment's full length
+//  idx        : branch index at this depth (for deterministic jitter lookup)
+// ─────────────────────────────────────────────────────────────────────────────
+function drawBranch(depth, x, y, baseAngle, length, idx) {
+  if (depth > _maxVis) return;
+
+  // Per-branch random angle offset (stable across frames)
+  const jitter = angleJitter(depth, idx);
+
+  // Structural angle = parent direction ± spread ± jitter (no wind)
+  const structAngle = baseAngle + jitter;
+
+  // Wind bends branches with power-curve weighting toward tips
+  const windBend = _wind * CFG.windScale * Math.pow(depth / CFG.maxDepth, 0.60);
+
+  // Visual draw angle
+  const drawAngle = structAngle + windBend;
+
+  // Growth-front: shorten the branch at the current growing edge
+  const drawLen = (depth === _maxVis) ? length * _partial : length;
+
+  const x2 = x + Math.cos(drawAngle) * drawLen;
+  const y2 = y - Math.sin(drawAngle) * drawLen;   // canvas y increases downward
+
+  // ── Draw segment ──
+  ctx.beginPath();
+  ctx.moveTo(x, y);
+  ctx.lineTo(x2, y2);
+  ctx.strokeStyle = branchColor(depth);
+  ctx.lineWidth   = branchWidth(depth);
+  ctx.stroke();
+
+  // ── Leaves at tips (last two depths, after fully grown) ──
+  if (leafOpacity > 0 && depth >= CFG.maxDepth - 1 && depth !== _maxVis) {
+    drawLeaf(x2, y2, depth, idx);
+  }
+
+  if (depth === _maxVis) return; // growth front – stop here
+
+  // ── Recurse ──
+  const childLen = length * CFG.ratio;
+
+  // Children inherit the *structural* angle (not the wind-bent one) so wind
+  // is applied independently at each level, preventing exponential drift.
+  drawBranch(depth + 1, x2, y2, structAngle + CFG.spread, childLen, idx * 2);
+  drawBranch(depth + 1, x2, y2, structAngle - CFG.spread, childLen, idx * 2 + 1);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Animation loop
+// ─────────────────────────────────────────────────────────────────────────────
+function tick(ts) {
+  if (!prevTS) prevTS = ts;
+  const dt = Math.min((ts - prevTS) / 1000, 0.05); // cap at 50 ms
+  prevTS = ts;
+  time  += dt;
+
+  // ── Phase: growing ──
+  if (phase === 'growing') {
+    growProgress += dt * CFG.growSpeed;
+    if (growProgress >= CFG.maxDepth) {
+      growProgress = CFG.maxDepth;
+      phase = 'swaying';
+      label.textContent = 'SWAYING';
+    }
+    // Show depth progress while growing
+    label.textContent = `GROWING  ·  depth ${Math.floor(growProgress)} / ${CFG.maxDepth}`;
+  }
+
+  // ── Phase: swaying – fade in leaves ──
+  if (phase === 'swaying') {
+    leafOpacity = Math.min(leafOpacity + dt * CFG.leafFadeSpd, 1);
+    label.textContent = 'SWAYING';
+  }
+
+  // ── Per-frame draw params ──
+  _maxVis  = Math.floor(growProgress);
+  _partial = growProgress - _maxVis;
+  _wind    = (phase === 'swaying') ? windValue(time) : 0;
+
+  // ── Render ──
+  drawBackground();
+  drawStars(time);
+  drawMoon();
+  drawGround();
+
+  ctx.save();
+  ctx.lineCap  = 'round';
+  ctx.lineJoin = 'round';
+  drawBranch(0, W / 2, H * CFG.groundY, Math.PI / 2, H * CFG.trunkFrac, 0);
+  ctx.restore();
+
+  requestAnimationFrame(tick);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Resize
+// ─────────────────────────────────────────────────────────────────────────────
+function resize() {
+  W = canvas.width  = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+  buildBgGrad();
+}
+
+window.addEventListener('resize', resize);
+resize();
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
